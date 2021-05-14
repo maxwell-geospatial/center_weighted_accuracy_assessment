@@ -1,0 +1,931 @@
+cwghtAccVec <- function(reference, predicted, mask, cellSize, referenceCls, predictedCls, pwr=1, areaBased=TRUE, twoClass=TRUE, satDist=10000, grass_Dir){
+  
+  #Read in required packages
+  require(raster)
+  require(sp)
+  require(sf)
+  require(dplyr)
+  require(stats)
+  require(fasterize)
+  require(fasterRaster)
+  require(caret)
+  require(rfUtilities)
+  require(diffeR)
+  use_sp()
+  
+  #Read in vectors and raster mask
+  #Raster mask should have all cells in the extent coded to 1.
+  #Vectors should have a "class" field.
+  #Define processing cell size. Smaller cell size will cause longer processing time. 
+  cor_p <- reference
+  pred_p <- predicted
+  mask <-  mask
+  cellSize <- cellSize
+  correct_cf <- referenceCls
+  predicted_cf <- predictedCls
+  pwr <- pwr
+  areaBased <- areaBased
+  twoClass <- twoClass
+  grass_dir <- grass_Dir
+  maxDist <- satDist
+  
+  #Calculate cell area. 
+  cellArea <- cellSize*cellSize
+  
+  if (areaBased==TRUE & twoClass==FALSE){
+    
+    #Prep correct data.
+    
+    #Merge adjacent polygons of the same class.
+    names(cor_p)[which(names(cor_p)==correct_cf)] <- "class"
+    cor_p2 <- cor_p %>% group_by(class) %>% summarize()
+    cor_p3 <- st_cast(cor_p2, "POLYGON")
+    cor_p3$id <- as.factor(rownames(cor_p3))
+    
+    #Generate raster of class codes.
+    cor_r <- fasterize(cor_p3, mask, correct_cf)
+    
+    #Generate raster of unique IDS.
+    cor_id <- fasterize(cor_p3, mask, "id")
+    
+    #Prep predicted data.
+    
+    #Merge adjacent polygons of the same class. 
+    names(pred_p)[which(names(pred_p)==predicted_cf)] <- "class"
+    pred_p2 <- pred_p %>% group_by(class) %>% summarize()
+    pred_p3 <- st_cast(pred_p2, "POLYGON")
+    pred_p3$id <- as.factor(rownames(pred_p3))
+    
+    #Generate raster of class codes.
+    pred_r <- fasterize(pred_p3, mask, predicted_cf)
+    
+    #Generate raster of unique IDS.
+    pred_id <- fasterize(pred_p3, mask, "id")
+    
+    #Convert NA to 0 just in case data are not contiguous. Treat 0 as background class. 
+    cor_r[is.na(cor_r)] <- 0
+    pred_r[is.na(pred_r)] <- 0
+    cor_id[is.na(cor_id)] <- 0
+    pred_id[is.na(pred_id)] <- 0
+    
+    #Create Euclidean distance from polygon edges. 
+    cor_sp <- as(cor_p3, "Spatial")
+    cor_l <- as(cor_sp, "SpatialLinesDataFrame")
+    cor_dist <- fasterVectToRastDistance(rast=mask, vect=cor_l, metric="euclidean", 
+                                         meters=TRUE, grassDir=grass_dir, grassToR=TRUE)
+    
+    pred_sp <- as(pred_p3, "Spatial")
+    pred_l <- as(pred_sp, "SpatialLinesDataFrame")
+    pred_dist <- fasterVectToRastDistance(rast=mask, vect=pred_l, metric="euclidean", 
+                                          meters=TRUE, grassDir=grass_dir, grassToR=TRUE)
+    
+    #Raise distance to provided power to define the relative impact of distance. 
+    
+    cor_dist[cor_dist > maxDist] <- maxDist
+    pred_dist[pred_dist > maxDist] <- maxDist
+    
+    cor_pwr <- cor_dist^pwr
+    
+    pred_pwr <- pred_dist^pwr
+    
+    #Summarize relative to zones
+    crs(cor_pwr) <- crs(cor_id)
+    cor_dist_sum <- as.data.frame(zonal(cor_pwr, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_dist_sum$zone
+    to1 <- cor_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_dist_sum_r <- cor_id
+    cor_dist_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(mask) <- crs(cor_id)
+    cor_cell_sum <- as.data.frame(zonal(mask, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_cell_sum$zone
+    to1 <- cor_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_cell_sum_r <- cor_id
+    cor_cell_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(pred_pwr) <- crs(pred_id)
+    pred_dist_sum <- as.data.frame(zonal(pred_pwr, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_dist_sum$zone
+    to1 <- pred_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_dist_sum_r <- pred_id
+    pred_dist_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    
+    pred_cell_sum <- as.data.frame(zonal(mask, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_cell_sum$zone
+    to1 <- pred_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_cell_sum_r <- pred_id
+    pred_cell_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    #Normalize and finalize grids.
+    
+    cor_norm <- (cor_pwr/cor_dist_sum_r2)*(cellArea*cor_cell_sum_r2)
+    cor_norm[is.na(cor_norm)] <- 0
+    
+    pred_norm <- (pred_pwr/pred_dist_sum_r2)*(cellArea*pred_cell_sum_r2)
+    pred_norm[is.na(pred_norm)] <- 0
+    
+    stk <- stack(cor_r, pred_r, cor_norm, pred_norm)
+    
+    r1df <- as.data.frame(stk)
+    r1df2 <- r1df[complete.cases(r1df), ]
+    names(r1df2) <- c("correct", "predicted", "corwght", "predwght")
+    r1df2$cmbwght <- (r1df2$corwght + r1df2$predwght)/2
+    
+    t1 <- xtabs(formula= cmbwght~predicted+correct, data=r1df2)
+    
+    t1_cm <- confusionMatrix(t1, mode="everything")
+    t1_cm2 <- accuracy(t1)
+    t1_cm$producers.accuracy <- t1_cm2$producers.accuracy
+    t1_cm$users.accuracy <- t1_cm2$users.accuracy
+    Error <- overallDiff(t1)/sum(t1)
+    Allocation <- overallAllocD(t1)/sum(t1)
+    Quantity <- overallQtyD(t1)*100/sum(t1)
+    Exchange <- overallExchangeD(t1)/sum(t1)
+    Shift <- overallShiftD(t1)/sum(t1)
+    pontius <- as.data.frame(cbind(Error, Allocation, Quantity, Exchange, Shift))
+    t1_cm$pontius <- pontius
+  }
+  else if (areaBased==FALSE & twoClass==FALSE){
+    #Prep correct data.
+    
+    #Merge adjacent polygons of the same class.
+    names(cor_p)[which(names(cor_p)==correct_cf)] <- "class"
+    cor_p2 <- cor_p %>% group_by(class) %>% summarize()
+    cor_p3 <- st_cast(cor_p2, "POLYGON")
+    cor_p3$id <- as.factor(rownames(cor_p3))
+    
+    #Generate raster of class codes.
+    cor_r <- fasterize(cor_p3, mask, correct_cf)
+    
+    #Generate raster of unique IDS.
+    cor_id <- fasterize(cor_p3, mask, "id")
+    
+    #Prep predicted data.
+    
+    #Merge adjacent polygons of the same class. 
+    names(pred_p)[which(names(pred_p)==predicted_cf)] <- "class"
+    pred_p2 <- pred_p %>% group_by(class) %>% summarize()
+    pred_p3 <- st_cast(pred_p2, "POLYGON")
+    pred_p3$id <- as.factor(rownames(pred_p3))
+    
+    #Generate raster of class codes.
+    pred_r <- fasterize(pred_p3, mask, predicted_cf)
+    
+    #Generate raster of unique IDS.
+    pred_id <- fasterize(pred_p3, mask, "id")
+    
+    #Convert NA to 0 just in case data are not contiguous. Treat 0 as background class. 
+    cor_r[is.na(cor_r)] <- 0
+    pred_r[is.na(pred_r)] <- 0
+    cor_id[is.na(cor_id)] <- 0
+    pred_id[is.na(pred_id)] <- 0
+    
+    #Create Euclidean distance from polygon edges. 
+    cor_sp <- as(cor_p3, "Spatial")
+    cor_l <- as(cor_sp, "SpatialLinesDataFrame")
+    cor_dist <- fasterVectToRastDistance(rast=mask, vect=cor_l, metric="euclidean", 
+                                         meters=TRUE, grassDir=grass_dir, grassToR=TRUE)
+    
+    pred_sp <- as(pred_p3, "Spatial")
+    pred_l <- as(pred_sp, "SpatialLinesDataFrame")
+    pred_dist <- fasterVectToRastDistance(rast=mask, vect=pred_l, metric="euclidean", 
+                                          meters=TRUE, grassDir=grass_dir, grassToR=TRUE)
+    
+    #Raise distance to provided power to define the relative impact of distance. 
+    
+    cor_dist[cor_dist > maxDist] <- maxDist
+    pred_dist[pred_dist > maxDist] <- maxDist
+    
+    cor_pwr <- cor_dist^pwr
+    
+    pred_pwr <- pred_dist^pwr
+    
+    #Summarize relative to zones
+    crs(cor_pwr) <- crs(cor_id)
+    cor_dist_sum <- as.data.frame(zonal(cor_pwr, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_dist_sum$zone
+    to1 <- cor_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_dist_sum_r <- cor_id
+    cor_dist_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(mask) <- crs(cor_id)
+    cor_cell_sum <- as.data.frame(zonal(mask, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_cell_sum$zone
+    to1 <- cor_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_cell_sum_r <- cor_id
+    cor_cell_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(pred_pwr) <- crs(pred_id)
+    pred_dist_sum <- as.data.frame(zonal(pred_pwr, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_dist_sum$zone
+    to1 <- pred_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_dist_sum_r <- pred_id
+    pred_dist_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    
+    pred_cell_sum <- as.data.frame(zonal(mask, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_cell_sum$zone
+    to1 <- pred_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_cell_sum_r <- pred_id
+    pred_cell_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    #Normalize and finalize grids.
+    
+    cor_norm <- (cor_pwr/cor_dist_sum_r2)
+    cor_norm[is.na(cor_norm)] <- 0
+    
+    pred_norm <- (pred_pwr/pred_dist_sum_r2)
+    pred_norm[is.na(pred_norm)] <- 0
+    
+    stk <- stack(cor_r, pred_r, cor_norm, pred_norm)
+    
+    r1df <- as.data.frame(stk)
+    r1df2 <- r1df[complete.cases(r1df), ]
+    names(r1df2) <- c("correct", "predicted", "corwght", "predwght")
+    r1df2$cmbwght <- (r1df2$corwght + r1df2$predwght)/2
+    
+    t1 <- xtabs(formula= cmbwght~predicted+correct, data=r1df2)
+    
+    t1_cm <- confusionMatrix(t1, mode="everything")
+    t1_cm2 <- accuracy(t1)
+    t1_cm$producers.accuracy <- t1_cm2$producers.accuracy
+    t1_cm$users.accuracy <- t1_cm2$users.accuracy
+    Error <- overallDiff(t1)/sum(t1)
+    Allocation <- overallAllocD(t1)/sum(t1)
+    Quantity <- overallQtyD(t1)*100/sum(t1)
+    Exchange <- overallExchangeD(t1)/sum(t1)
+    Shift <- overallShiftD(t1)/sum(t1)
+    pontius <- as.data.frame(cbind(Error, Allocation, Quantity, Exchange, Shift))
+    t1_cm$pontius <- pontius
+    
+  }
+  else if (areaBased==TRUE & twoClass==TRUE){
+    
+    #Prep correct data.
+    
+    #Merge adjacent polygons of the same class.
+    names(cor_p)[which(names(cor_p)==correct_cf)] <- "class"
+    cor_p2 <- cor_p %>% group_by(class) %>% summarize()
+    cor_p3 <- st_cast(cor_p2, "POLYGON")
+    cor_p3$id <- as.factor(rownames(cor_p3))
+    
+    #Generate raster of class codes.
+    cor_r <- fasterize(cor_p3, mask, correct_cf)
+    
+    #Generate raster of unique IDS.
+    cor_id <- fasterize(cor_p3, mask, "id")
+    
+    #Prep predicted data.
+    
+    #Merge adjacent polygons of the same class. 
+    names(pred_p)[which(names(pred_p)==predicted_cf)] <- "class"
+    pred_p2 <- pred_p %>% group_by(class) %>% summarize()
+    pred_p3 <- st_cast(pred_p2, "POLYGON")
+    pred_p3$id <- as.factor(rownames(pred_p3))
+    
+    #Generate raster of class codes.
+    pred_r <- fasterize(pred_p3, mask, predicted_cf)
+    
+    #Generate raster of unique IDS.
+    pred_id <- fasterize(pred_p3, mask, "id")
+    
+    #Convert NA to 0 just in case data are not contiguous. Treat 0 as background class. 
+    cor_r[is.na(cor_r)] <- 0
+    pred_r[is.na(pred_r)] <- 0
+    cor_id[is.na(cor_id)] <- 0
+    pred_id[is.na(pred_id)] <- 0
+    
+    #Create Euclidean distance from polygon edges. 
+    cor_sp <- as(cor_p3, "Spatial")
+    cor_l <- as(cor_sp, "SpatialLinesDataFrame")
+    cor_dist <- fasterVectToRastDistance(rast=mask, vect=cor_l, metric="euclidean", 
+                                         meters=TRUE, grassDir=grass_dir, grassToR=TRUE)
+    
+    pred_sp <- as(pred_p3, "Spatial")
+    pred_l <- as(pred_sp, "SpatialLinesDataFrame")
+    pred_dist <- fasterVectToRastDistance(rast=mask, vect=pred_l, metric="euclidean", 
+                                          meters=TRUE, grassDir=grass_dir, grassToR=TRUE)
+    
+    #Raise distance to provided power to define the relative impact of distance. 
+    
+    cor_dist[cor_dist > maxDist] <- maxDist
+    pred_dist[pred_dist > maxDist] <- maxDist
+    
+    cor_pwr <- cor_dist^pwr
+    
+    pred_pwr <- pred_dist^pwr
+    
+    #Summarize relative to zones
+    crs(cor_pwr) <- crs(cor_id)
+    cor_dist_sum <- as.data.frame(zonal(cor_pwr, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_dist_sum$zone
+    to1 <- cor_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_dist_sum_r <- cor_id
+    cor_dist_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(mask) <- crs(cor_id)
+    cor_cell_sum <- as.data.frame(zonal(mask, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_cell_sum$zone
+    to1 <- cor_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_cell_sum_r <- cor_id
+    cor_cell_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(pred_pwr) <- crs(pred_id)
+    pred_dist_sum <- as.data.frame(zonal(pred_pwr, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_dist_sum$zone
+    to1 <- pred_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_dist_sum_r <- pred_id
+    pred_dist_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    
+    pred_cell_sum <- as.data.frame(zonal(mask, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_cell_sum$zone
+    to1 <- pred_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_cell_sum_r <- pred_id
+    pred_cell_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    #Normalize and finalize grids.
+    
+    cor_norm <- (cor_pwr/cor_dist_sum_r2)*(cellArea*cor_cell_sum_r2)
+    cor_norm[is.na(cor_norm)] <- 0
+    
+    pred_norm <- (pred_pwr/pred_dist_sum_r2)*(cellArea*pred_cell_sum_r2)
+    pred_norm[is.na(pred_norm)] <- 0
+    
+    stk <- stack(cor_r, pred_r, cor_norm, pred_norm)
+    
+    r1df <- as.data.frame(stk)
+    r1df2 <- r1df[complete.cases(r1df), ]
+    names(r1df2) <- c("correct", "predicted", "corwght", "predwght")
+    r1df2$cmbwght <- (r1df2$corwght + r1df2$predwght)/2
+    
+    t1 <- xtabs(formula= cmbwght~predicted+correct, data=r1df2)
+    
+    t1_cm <- confusionMatrix(t1, mode="everything", positive="1")
+    
+  }
+  else { 
+    #Prep correct data.
+    
+    #Merge adjacent polygons of the same class.
+    names(cor_p)[which(names(cor_p)==correct_cf)] <- "class"
+    cor_p2 <- cor_p %>% group_by(class) %>% summarize()
+    cor_p3 <- st_cast(cor_p2, "POLYGON")
+    cor_p3$id <- as.factor(rownames(cor_p3))
+    
+    #Generate raster of class codes.
+    cor_r <- fasterize(cor_p3, mask, correct_cf)
+    
+    #Generate raster of unique IDS.
+    cor_id <- fasterize(cor_p3, mask, "id")
+    
+    #Prep predicted data.
+    
+    #Merge adjacent polygons of the same class. 
+    names(pred_p)[which(names(pred_p)==predicted_cf)] <- "class"
+    pred_p2 <- pred_p %>% group_by(class) %>% summarize()
+    pred_p3 <- st_cast(pred_p2, "POLYGON")
+    pred_p3$id <- as.factor(rownames(pred_p3))
+    
+    #Generate raster of class codes.
+    pred_r <- fasterize(pred_p3, mask, predicted_cf)
+    
+    #Generate raster of unique IDS.
+    pred_id <- fasterize(pred_p3, mask, "id")
+    
+    #Convert NA to 0 just in case data are not contiguous. Treat 0 as background class. 
+    cor_r[is.na(cor_r)] <- 0
+    pred_r[is.na(pred_r)] <- 0
+    cor_id[is.na(cor_id)] <- 0
+    pred_id[is.na(pred_id)] <- 0
+    
+    #Create Euclidean distance from polygon edges. 
+    cor_sp <- as(cor_p3, "Spatial")
+    cor_l <- as(cor_sp, "SpatialLinesDataFrame")
+    cor_dist <- fasterVectToRastDistance(rast=mask, vect=cor_l, metric="euclidean", 
+                                         meters=TRUE, grassDir=grass_dir, grassToR=TRUE)
+    
+    pred_sp <- as(pred_p3, "Spatial")
+    pred_l <- as(pred_sp, "SpatialLinesDataFrame")
+    pred_dist <- fasterVectToRastDistance(rast=mask, vect=pred_l, metric="euclidean", 
+                                          meters=TRUE, grassDir=grass_dir, grassToR=TRUE)
+    
+    #Raise distance to provided power to define the relative impact of distance. 
+    
+    cor_dist[cor_dist > maxDist] <- maxDist
+    pred_dist[pred_dist > maxDist] <- maxDist
+    
+    cor_pwr <- cor_dist^pwr
+    
+    pred_pwr <- pred_dist^pwr
+    
+    #Summarize relative to zones
+    crs(cor_pwr) <- crs(cor_id)
+    cor_dist_sum <- as.data.frame(zonal(cor_pwr, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_dist_sum$zone
+    to1 <- cor_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_dist_sum_r <- cor_id
+    cor_dist_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(mask) <- crs(cor_id)
+    cor_cell_sum <- as.data.frame(zonal(mask, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_cell_sum$zone
+    to1 <- cor_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_cell_sum_r <- cor_id
+    cor_cell_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(pred_pwr) <- crs(pred_id)
+    pred_dist_sum <- as.data.frame(zonal(pred_pwr, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_dist_sum$zone
+    to1 <- pred_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_dist_sum_r <- pred_id
+    pred_dist_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    
+    pred_cell_sum <- as.data.frame(zonal(mask, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_cell_sum$zone
+    to1 <- pred_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_cell_sum_r <- pred_id
+    pred_cell_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    #Normalize and finalize grids.
+    
+    cor_norm <- (cor_pwr/cor_dist_sum_r2)
+    cor_norm[is.na(cor_norm)] <- 0
+    
+    pred_norm <- (pred_pwr/pred_dist_sum_r2)
+    pred_norm[is.na(pred_norm)] <- 0
+    
+    stk <- stack(cor_r, pred_r, cor_norm, pred_norm)
+    
+    r1df <- as.data.frame(stk)
+    r1df2 <- r1df[complete.cases(r1df), ]
+    names(r1df2) <- c("correct", "predicted", "corwght", "predwght")
+    r1df2$cmbwght <- (r1df2$corwght + r1df2$predwght)/2
+    
+    t1 <- xtabs(formula= cmbwght~predicted+correct, data=r1df2)
+    
+    t1_cm <- confusionMatrix(t1, mode="everything", positive="1")
+  }
+  return(t1_cm)
+}
+
+
+
+cwghtAccRst <- function(referenceID, predictedID, referenceCls, predictedCls, mask, cellSize, pwr=1, areaBased=TRUE, twoClass=TRUE, satDist=10000, grass_Dir){
+  
+  #Read in required packages
+  require(raster)
+  require(sp)
+  require(sf)
+  require(dplyr)
+  require(stats)
+  require(fasterize)
+  require(fasterRaster)
+  require(caret)
+  require(rfUtilities)
+  require(diffeR)
+  use_sp()
+  
+  #Read in raster data
+  #Raster mask should have all cells in the extent coded to 1.
+  #Vectors should have a "class" field.
+  #Define processing cell size. Smaller cell size will cause longer processing time. 
+  referenceID <- referenceID
+  predictedID <- predictedID
+  referenceCls <- referenceCls
+  predictedCls <- predictedCls
+  mask <-  mask
+  cellSize <- cellSize
+  pwr <- pwr
+  areaBased <- areaBased
+  twoClass <- twoClass
+  grass_Dir <- grass_Dir
+  maxDist <- satDist
+  
+  #Calculate cell area. 
+  cellArea <- cellSize*cellSize
+  
+  if (areaBased==TRUE & twoClass==FALSE){
+    
+    #Prep correct data.
+    
+    #Generate raster of class codes.
+    cor_r <- referenceCls*mask
+    
+    #Generate raster of unique IDS.
+    cor_id <- referenceID*mask
+    
+    #Prep predicted data.
+    
+    #Generate raster of class codes.
+    pred_r <- predictedCls*mask
+    
+    #Generate raster of unique IDS.
+    pred_id <- predictedID*mask
+    
+    #Convert NA to 0 just in case data are not contiguous. Treat 0 as background class. 
+    cor_r[is.na(cor_r)] <- 0
+    pred_r[is.na(pred_r)] <- 0
+    cor_id[is.na(cor_id)] <- 0
+    pred_id[is.na(pred_id)] <- 0
+    
+    #Create Euclidean distance from polygon edges. 
+    cor_sp <- fasterVectorize(cor_r, vectType='area', grassDir=grass_Dir)
+    cor_l <- as(cor_sp, "SpatialLinesDataFrame")
+    cor_dist <- fasterVectToRastDistance(rast=mask, vect=cor_l, metric="euclidean", 
+                                         meters=TRUE, grassDir=grass_Dir, grassToR=TRUE)
+    
+    pred_sp <- fasterVectorize(pred_r, vectType='area', grassDir=grass_Dir)
+    pred_l <- as(pred_sp, "SpatialLinesDataFrame")
+    pred_dist <- fasterVectToRastDistance(rast=mask, vect=pred_l, metric="euclidean", 
+                                          meters=TRUE, grassDir=grass_Dir, grassToR=TRUE)
+    
+    #Raise distance to provided power to define the relative impact of distance. 
+    
+    cor_dist[cor_dist > maxDist] <- maxDist
+    pred_dist[pred_dist > maxDist] <- maxDist
+    
+    cor_pwr <- cor_dist^pwr
+    
+    pred_pwr <- pred_dist^pwr
+    
+    #Summarize relative to zones
+    crs(cor_pwr) <- crs(cor_id)
+    cor_dist_sum <- as.data.frame(zonal(cor_pwr, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_dist_sum$zone
+    to1 <- cor_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_dist_sum_r <- cor_id
+    cor_dist_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(mask) <- crs(cor_id)
+    cor_cell_sum <- as.data.frame(zonal(mask, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_cell_sum$zone
+    to1 <- cor_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_cell_sum_r <- cor_id
+    cor_cell_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(pred_pwr) <- crs(pred_id)
+    pred_dist_sum <- as.data.frame(zonal(pred_pwr, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_dist_sum$zone
+    to1 <- pred_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_dist_sum_r <- pred_id
+    pred_dist_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    
+    pred_cell_sum <- as.data.frame(zonal(mask, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_cell_sum$zone
+    to1 <- pred_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_cell_sum_r <- pred_id
+    pred_cell_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    #Normalize and finalize grids.
+    
+    cor_norm <- (cor_pwr/cor_dist_sum_r2)*(cellArea*cor_cell_sum_r2)
+    cor_norm[is.na(cor_norm)] <- 0
+    
+    pred_norm <- (pred_pwr/pred_dist_sum_r2)*(cellArea*pred_cell_sum_r2)
+    pred_norm[is.na(pred_norm)] <- 0
+    
+    stk <- stack(cor_r, pred_r, cor_norm, pred_norm)
+    
+    r1df <- as.data.frame(stk)
+    r1df2 <- r1df[complete.cases(r1df), ]
+    names(r1df2) <- c("correct", "predicted", "corwght", "predwght")
+    r1df2$cmbwght <- (r1df2$corwght + r1df2$predwght)/2
+    
+    t1 <- xtabs(formula= cmbwght~predicted+correct, data=r1df2)
+    
+    t1_cm <- confusionMatrix(t1, mode="everything")
+    t1_cm2 <- accuracy(t1)
+    t1_cm$producers.accuracy <- t1_cm2$producers.accuracy
+    t1_cm$users.accuracy <- t1_cm2$users.accuracy
+    Error <- overallDiff(t1)/sum(t1)
+    Allocation <- overallAllocD(t1)/sum(t1)
+    Quantity <- overallQtyD(t1)*100/sum(t1)
+    Exchange <- overallExchangeD(t1)/sum(t1)
+    Shift <- overallShiftD(t1)/sum(t1)
+    pontius <- as.data.frame(cbind(Error, Allocation, Quantity, Exchange, Shift))
+    t1_cm$pontius <- pontius
+  }
+  else if (areaBased==FALSE & twoClass==FALSE){
+    #Prep correct data.
+    
+    #Generate raster of class codes.
+    cor_r <- referenceCls*mask
+    
+    #Generate raster of unique IDS.
+    cor_id <- referenceID*mask
+    
+    #Prep predicted data.
+    
+    #Generate raster of class codes.
+    pred_r <- predictedCls*mask
+    
+    #Generate raster of unique IDS.
+    pred_id <- predictedID*mask
+    
+    #Convert NA to 0 just in case data are not contiguous. Treat 0 as background class. 
+    cor_r[is.na(cor_r)] <- 0
+    pred_r[is.na(pred_r)] <- 0
+    cor_id[is.na(cor_id)] <- 0
+    pred_id[is.na(pred_id)] <- 0
+    
+    #Create Euclidean distance from polygon edges. 
+    cor_sp <- fasterVectorize(cor_r, vectType='area', grassDir=grass_Dir)
+    cor_l <- as(cor_sp, "SpatialLinesDataFrame")
+    cor_dist <- fasterVectToRastDistance(rast=mask, vect=cor_l, metric="euclidean", 
+                                         meters=TRUE, grassDir=grass_Dir, grassToR=TRUE)
+    
+    pred_sp <- fasterVectorize(pred_r, vectType='area', grassDir=grass_Dir)
+    pred_l <- as(pred_sp, "SpatialLinesDataFrame")
+    pred_dist <- fasterVectToRastDistance(rast=mask, vect=pred_l, metric="euclidean", 
+                                          meters=TRUE, grassDir=grass_Dir, grassToR=TRUE)
+    
+    #Raise distance to provided power to define the relative impact of distance. 
+    
+    cor_dist[cor_dist > maxDist] <- maxDist
+    pred_dist[pred_dist > maxDist] <- maxDist
+    
+    cor_pwr <- cor_dist^pwr
+    
+    pred_pwr <- pred_dist^pwr
+    
+    #Summarize relative to zones
+    crs(cor_pwr) <- crs(cor_id)
+    cor_dist_sum <- as.data.frame(zonal(cor_pwr, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_dist_sum$zone
+    to1 <- cor_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_dist_sum_r <- cor_id
+    cor_dist_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(mask) <- crs(cor_id)
+    cor_cell_sum <- as.data.frame(zonal(mask, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_cell_sum$zone
+    to1 <- cor_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_cell_sum_r <- cor_id
+    cor_cell_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(pred_pwr) <- crs(pred_id)
+    pred_dist_sum <- as.data.frame(zonal(pred_pwr, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_dist_sum$zone
+    to1 <- pred_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_dist_sum_r <- pred_id
+    pred_dist_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    
+    pred_cell_sum <- as.data.frame(zonal(mask, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_cell_sum$zone
+    to1 <- pred_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_cell_sum_r <- pred_id
+    pred_cell_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    #Normalize and finalize grids.
+    
+    cor_norm <- (cor_pwr/cor_dist_sum_r2)
+    cor_norm[is.na(cor_norm)] <- 0
+    
+    pred_norm <- (pred_pwr/pred_dist_sum_r2)
+    pred_norm[is.na(pred_norm)] <- 0
+    
+    stk <- stack(cor_r, pred_r, cor_norm, pred_norm)
+    
+    r1df <- as.data.frame(stk)
+    r1df2 <- r1df[complete.cases(r1df), ]
+    names(r1df2) <- c("correct", "predicted", "corwght", "predwght")
+    r1df2$cmbwght <- (r1df2$corwght + r1df2$predwght)/2
+    
+    t1 <- xtabs(formula= cmbwght~predicted+correct, data=r1df2)
+    
+    t1_cm <- confusionMatrix(t1, mode="everything")
+    t1_cm2 <- accuracy(t1)
+    t1_cm$producers.accuracy <- t1_cm2$producers.accuracy
+    t1_cm$users.accuracy <- t1_cm2$users.accuracy
+    Error <- overallDiff(t1)/sum(t1)
+    Allocation <- overallAllocD(t1)/sum(t1)
+    Quantity <- overallQtyD(t1)*100/sum(t1)
+    Exchange <- overallExchangeD(t1)/sum(t1)
+    Shift <- overallShiftD(t1)/sum(t1)
+    pontius <- as.data.frame(cbind(Error, Allocation, Quantity, Exchange, Shift))
+    t1_cm$pontius <- pontius
+    
+  }
+  else if (areaBased==TRUE & twoClass==TRUE){
+    
+    #Prep correct data.
+    
+    #Generate raster of class codes.
+    cor_r <- referenceCls*mask
+    
+    #Generate raster of unique IDS.
+    cor_id <- referenceID*mask
+    
+    #Prep predicted data.
+    
+    #Generate raster of class codes.
+    pred_r <- predictedCls*mask
+    
+    #Generate raster of unique IDS.
+    pred_id <- predictedID*mask
+    
+    #Convert NA to 0 just in case data are not contiguous. Treat 0 as background class. 
+    cor_r[is.na(cor_r)] <- 0
+    pred_r[is.na(pred_r)] <- 0
+    cor_id[is.na(cor_id)] <- 0
+    pred_id[is.na(pred_id)] <- 0
+    
+    #Create Euclidean distance from polygon edges. 
+    cor_sp <- fasterVectorize(cor_r, vectType='area', grassDir=grass_Dir)
+    cor_l <- as(cor_sp, "SpatialLinesDataFrame")
+    cor_dist <- fasterVectToRastDistance(rast=mask, vect=cor_l, metric="euclidean", 
+                                         meters=TRUE, grassDir=grass_Dir, grassToR=TRUE)
+    
+    pred_sp <- fasterVectorize(pred_r, vectType='area', grassDir=grass_Dir)
+    pred_l <- as(pred_sp, "SpatialLinesDataFrame")
+    pred_dist <- fasterVectToRastDistance(rast=mask, vect=pred_l, metric="euclidean", 
+                                          meters=TRUE, grassDir=grass_Dir, grassToR=TRUE)
+    
+    #Raise distance to provided power to define the relative impact of distance. 
+    
+    cor_dist[cor_dist > maxDist] <- maxDist
+    pred_dist[pred_dist > maxDist] <- maxDist
+    
+    cor_pwr <- cor_dist^pwr
+    
+    pred_pwr <- pred_dist^pwr
+    
+    #Summarize relative to zones
+    crs(cor_pwr) <- crs(cor_id)
+    cor_dist_sum <- as.data.frame(zonal(cor_pwr, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_dist_sum$zone
+    to1 <- cor_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_dist_sum_r <- cor_id
+    cor_dist_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(mask) <- crs(cor_id)
+    cor_cell_sum <- as.data.frame(zonal(mask, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_cell_sum$zone
+    to1 <- cor_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_cell_sum_r <- cor_id
+    cor_cell_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(pred_pwr) <- crs(pred_id)
+    pred_dist_sum <- as.data.frame(zonal(pred_pwr, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_dist_sum$zone
+    to1 <- pred_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_dist_sum_r <- pred_id
+    pred_dist_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    
+    pred_cell_sum <- as.data.frame(zonal(mask, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_cell_sum$zone
+    to1 <- pred_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_cell_sum_r <- pred_id
+    pred_cell_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    #Normalize and finalize grids.
+    
+    cor_norm <- (cor_pwr/cor_dist_sum_r2)*(cellArea*cor_cell_sum_r2)
+    cor_norm[is.na(cor_norm)] <- 0
+    
+    pred_norm <- (pred_pwr/pred_dist_sum_r2)*(cellArea*pred_cell_sum_r2)
+    pred_norm[is.na(pred_norm)] <- 0
+    
+    stk <- stack(cor_r, pred_r, cor_norm, pred_norm)
+    
+    r1df <- as.data.frame(stk)
+    r1df2 <- r1df[complete.cases(r1df), ]
+    names(r1df2) <- c("correct", "predicted", "corwght", "predwght")
+    r1df2$cmbwght <- (r1df2$corwght + r1df2$predwght)/2
+    
+    t1 <- xtabs(formula= cmbwght~predicted+correct, data=r1df2)
+    
+    t1_cm <- confusionMatrix(t1, mode="everything", positive="1")
+    
+  }
+  else { 
+    #Prep correct data.
+    
+    #Generate raster of class codes.
+    cor_r <- referenceCls*mask
+    
+    #Generate raster of unique IDS.
+    cor_id <- referenceID*mask
+    
+    #Prep predicted data.
+    
+    #Generate raster of class codes.
+    pred_r <- predictedCls*mask
+    
+    #Generate raster of unique IDS.
+    pred_id <- predictedID*mask
+    
+    #Convert NA to 0 just in case data are not contiguous. Treat 0 as background class. 
+    cor_r[is.na(cor_r)] <- 0
+    pred_r[is.na(pred_r)] <- 0
+    cor_id[is.na(cor_id)] <- 0
+    pred_id[is.na(pred_id)] <- 0
+    
+    #Create Euclidean distance from polygon edges. 
+    cor_sp <- fasterVectorize(cor_r, vectType='area', grassDir=grass_Dir)
+    cor_l <- as(cor_sp, "SpatialLinesDataFrame")
+    cor_dist <- fasterVectToRastDistance(rast=mask, vect=cor_l, metric="euclidean", 
+                                         meters=TRUE, grassDir=grass_Dir, grassToR=TRUE)
+    
+    pred_sp <- fasterVectorize(pred_r, vectType='area', grassDir=grass_Dir)
+    pred_l <- as(pred_sp, "SpatialLinesDataFrame")
+    pred_dist <- fasterVectToRastDistance(rast=mask, vect=pred_l, metric="euclidean", 
+                                          meters=TRUE, grassDir=grass_Dir, grassToR=TRUE)
+    
+    #Raise distance to provided power to define the relative impact of distance. 
+    
+    cor_dist[cor_dist > maxDist] <- maxDist
+    pred_dist[pred_dist > maxDist] <- maxDist
+    
+    cor_pwr <- cor_dist^pwr
+    
+    pred_pwr <- pred_dist^pwr
+    
+    #Summarize relative to zones
+    crs(cor_pwr) <- crs(cor_id)
+    cor_dist_sum <- as.data.frame(zonal(cor_pwr, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_dist_sum$zone
+    to1 <- cor_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_dist_sum_r <- cor_id
+    cor_dist_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(mask) <- crs(cor_id)
+    cor_cell_sum <- as.data.frame(zonal(mask, cor_id, fun="sum", na.rm=TRUE))
+    from1 <- cor_cell_sum$zone
+    to1 <- cor_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    cor_cell_sum_r <- cor_id
+    cor_cell_sum_r2 <- reclassify(cor_dist_sum_r, m1)
+    
+    crs(pred_pwr) <- crs(pred_id)
+    pred_dist_sum <- as.data.frame(zonal(pred_pwr, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_dist_sum$zone
+    to1 <- pred_dist_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_dist_sum_r <- pred_id
+    pred_dist_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    
+    pred_cell_sum <- as.data.frame(zonal(mask, pred_id, fun="sum", na.rm=TRUE))
+    from1 <- pred_cell_sum$zone
+    to1 <- pred_cell_sum$sum
+    m1 <- matrix(cbind(c(from1, to1)), ncol=2, byrow=FALSE)
+    pred_cell_sum_r <- pred_id
+    pred_cell_sum_r2 <- reclassify(pred_dist_sum_r, m1)
+    
+    #Normalize and finalize grids.
+    
+    cor_norm <- (cor_pwr/cor_dist_sum_r2)
+    cor_norm[is.na(cor_norm)] <- 0
+    
+    pred_norm <- (pred_pwr/pred_dist_sum_r2)
+    pred_norm[is.na(pred_norm)] <- 0
+    
+    stk <- stack(cor_r, pred_r, cor_norm, pred_norm)
+    
+    r1df <- as.data.frame(stk)
+    r1df2 <- r1df[complete.cases(r1df), ]
+    names(r1df2) <- c("correct", "predicted", "corwght", "predwght")
+    r1df2$cmbwght <- (r1df2$corwght + r1df2$predwght)/2
+    
+    t1 <- xtabs(formula= cmbwght~predicted+correct, data=r1df2)
+    
+    t1_cm <- confusionMatrix(t1, mode="everything", positive="1")
+  }
+  return(t1_cm)
+}
